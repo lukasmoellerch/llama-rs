@@ -159,6 +159,8 @@ extern "C" {
 
     pub fn ggml_silu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
 
+    pub fn ggml_gelu(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
+
     pub fn ggml_norm(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
 
     pub fn ggml_mul_mat(
@@ -218,6 +220,14 @@ extern "C" {
     pub fn ggml_soft_max(ctx: *mut ggml_context, a: *mut ggml_tensor) -> *mut ggml_tensor;
 
     pub fn ggml_rope(
+        ctx: *mut ggml_context,
+        a: *mut ggml_tensor,
+        n_past: c_int,
+        n_dims: c_int,
+        mode: c_int,
+    ) -> *mut ggml_tensor;
+
+    pub fn ggml_gptneox_rope(
         ctx: *mut ggml_context,
         a: *mut ggml_tensor,
         n_past: c_int,

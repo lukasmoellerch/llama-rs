@@ -12,7 +12,6 @@ use rustyline::error::ReadlineError;
 mod cli_args;
 
 fn repl_mode(
-    prompt: &str,
     model: &llama_rs::Model,
     vocab: &llama_rs::Vocabulary,
     params: &InferenceParameters,
@@ -24,7 +23,7 @@ fn repl_mode(
         match readline {
             Ok(line) => {
                 let mut session = model.start_session(*session_params);
-                let prompt = prompt.replace("$PROMPT", &line);
+                let prompt = format!("<|prompter|>{line}<|endoftext|><|assistant|>");
                 let mut rng = thread_rng();
 
                 let mut sp = spinners::Spinner::new(spinners::Spinners::Dots2, "".to_string());
@@ -148,6 +147,8 @@ fn main() {
         }
     } else if let Some(prompt) = &args.prompt {
         prompt.clone()
+    } else if args.repl {
+        "".into()
     } else {
         log::error!("No prompt or prompt file was provided. See --help");
         std::process::exit(1);
@@ -237,13 +238,7 @@ fn main() {
     };
 
     if args.repl {
-        repl_mode(
-            &prompt,
-            &model,
-            &vocab,
-            &inference_params,
-            &inference_session_params,
-        );
+        repl_mode(&model, &vocab, &inference_params, &inference_session_params);
     } else if let Some(cache_path) = &args.cache_prompt {
         let res =
             session.feed_prompt::<Infallible>(&model, &vocab, &inference_params, &prompt, |t| {

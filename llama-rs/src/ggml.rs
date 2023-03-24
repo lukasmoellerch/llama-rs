@@ -108,6 +108,11 @@ impl Context {
         self.new_tensor_raw(tensor)
     }
 
+    pub fn op_gelu(&self, a: &Tensor) -> Tensor {
+        let tensor = unsafe { ggml_raw::ggml_gelu(self.ptr.as_ptr(), a.ptr.as_ptr()) };
+        self.new_tensor_raw(tensor)
+    }
+
     pub fn op_scale(&self, a: &Tensor, b: &Tensor) -> Tensor {
         let tensor =
             unsafe { ggml_raw::ggml_scale(self.ptr.as_ptr(), a.ptr.as_ptr(), b.ptr.as_ptr()) };
@@ -159,6 +164,13 @@ impl Context {
     pub fn op_rope(&self, a: &Tensor, npast: i32, ndims: i32, mode: i32) -> Tensor {
         let tensor =
             unsafe { ggml_raw::ggml_rope(self.ptr.as_ptr(), a.ptr.as_ptr(), npast, ndims, mode) };
+        self.new_tensor_raw(tensor)
+    }
+
+    pub fn op_gtpneox_rope(&self, a: &Tensor, npast: i32, ndims: i32, mode: i32) -> Tensor {
+        let tensor = unsafe {
+            ggml_raw::ggml_gptneox_rope(self.ptr.as_ptr(), a.ptr.as_ptr(), npast, ndims, mode)
+        };
         self.new_tensor_raw(tensor)
     }
 

@@ -14,35 +14,47 @@ use thiserror::Error;
 use partial_sort::PartialSort;
 use rand::{distributions::WeightedIndex, prelude::Distribution};
 
-pub const EOD_TOKEN_ID: TokenId = 2; // Hardcoded (for now?)
+pub const EOD_TOKEN_ID: TokenId = 0; // Hardcoded (for now?)
 
 #[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Hyperparameters {
     n_vocab: i32,
     n_ctx: i32,
     n_embd: i32,
-    n_mult: i32,
     n_head: i32,
     n_layer: i32,
     n_rot: i32,
+    use_parallel_residual: i32, // 1 = true, 0 = false
     f16_: i32,
 }
 
 struct Layer {
-    attention_norm: ggml::Tensor,
+    // input_layernorm
+    input_layernorm_weight: ggml::Tensor,
+    input_layernorm_bias: ggml::Tensor,
 
-    wq: ggml::Tensor,
-    wk: ggml::Tensor,
-    wv: ggml::Tensor,
-    wo: ggml::Tensor,
+    // post_attention_layernorm
+    post_attention_layernorm_weight: ggml::Tensor,
+    post_attention_layernorm_bias: ggml::Tensor,
 
-    // normalization
-    ffn_norm: ggml::Tensor,
+    // attention
+    c_attn_q_proj_w: ggml::Tensor,
+    c_attn_k_proj_w: ggml::Tensor,
+    c_attn_v_proj_w: ggml::Tensor,
+
+    c_attn_q_proj_bias: ggml::Tensor,
+    c_attn_k_proj_bias: ggml::Tensor,
+    c_attn_v_proj_bias: ggml::Tensor,
+
+    c_attn_proj_w: ggml::Tensor,
+    c_attn_proj_bias: ggml::Tensor,
 
     // ff
-    w1: ggml::Tensor,
-    w2: ggml::Tensor,
-    w3: ggml::Tensor,
+    c_mlp_fc_w: ggml::Tensor,
+    c_mlp_fc_b: ggml::Tensor,
+
+    c_mlp_proj_w_trans: ggml::Tensor,
+    c_mlp_proj_b: ggml::Tensor,
 }
 
 /// The weights for the LLaMA model. All the mutable state is split into a
@@ -50,17 +62,19 @@ struct Layer {
 pub struct Model {
     hparams: Hyperparameters,
 
-    tok_embeddings: ggml::Tensor,
+    // final normalization
+    ln_f_g: ggml::Tensor,
+    ln_f_b: ggml::Tensor,
 
-    norm: ggml::Tensor,
-    output: ggml::Tensor,
+    wte: ggml::Tensor, // word embedding
 
+    lmh_g: ggml::Tensor, // language model head
+    // lmh_b: ggml::Tensor, // language model bias
     layers: Vec<Layer>,
-
-    tensors: HashMap<String, ggml::Tensor>,
 
     // Must be kept alive for the model
     _context: ggml::Context,
+    tensors: HashMap<String, ggml::Tensor>,
 }
 
 /// An inference session represents the state of the text generation. This holds
@@ -250,7 +264,7 @@ impl Display for OutputToken<'_> {
             "{}",
             match self {
                 OutputToken::Token(t) => *t,
-                OutputToken::EndOfText => "[end of text]",
+                OutputToken::EndOfText => "",
             }
         )
     }
@@ -494,15 +508,14 @@ impl Model {
             n_vocab: read_i32(&mut reader)?,
             n_ctx,
             n_embd: read_i32(&mut reader)?,
-            n_mult: read_i32(&mut reader)?,
             n_head: read_i32(&mut reader)?,
             n_layer: read_i32(&mut reader)?,
             n_rot: read_i32(&mut reader)?,
+            use_parallel_residual: read_i32(&mut reader)?,
             f16_: read_i32(&mut reader)?,
         };
 
-        let n_ff =
-            ((2 * (4 * hparams.n_embd) / 3 + hparams.n_mult - 1) / hparams.n_mult) * hparams.n_mult;
+        println!("Hyperparameters: {:?}", hparams);
 
         load_progress_callback(LoadProgress::HyperparametersLoaded(&hparams));
 
@@ -562,35 +575,67 @@ impl Model {
         let n_layer = hparams.n_layer;
         let n_vocab = hparams.n_vocab;
 
+        // ggml::type_sizef(wtype)
+        // ggml::type_sizef(ggml::TYPE_F32)
+
         let ctx_size = {
             // Use 64-bit math to prevent overflow.
             let n_embd = n_embd as u64;
             let n_layer = n_layer as u64;
             let n_vocab = n_vocab as u64;
-            let n_ff = n_ff as u64;
 
             let mut ctx_size: u64 = 0;
 
-            ctx_size += mulf!(n_embd, n_vocab, ggml::type_sizef(wtype)); // tok_embeddings
+            ctx_size += mulf!(n_embd, ggml::type_sizef(ggml::TYPE_F32)); // ln_f_g
+            ctx_size += mulf!(n_embd, ggml::type_sizef(ggml::TYPE_F32)); // ln_f_b
 
-            ctx_size += mulf!(n_embd, ggml::type_sizef(ggml::TYPE_F32)); // norm
+            ctx_size += mulf!(n_embd, n_vocab, ggml::type_sizef(wtype)); // wte
 
-            ctx_size += mulf!(n_embd, n_vocab, ggml::type_sizef(wtype)); // output
+            ctx_size += mulf!(n_embd, n_vocab, ggml::type_sizef(wtype)); // lmh_g
+                                                                         // ctx_size +=        n_vocab*ggml::type_sizef(ggml::TYPE_F32)); // lmh_b
 
-            ctx_size += mulf!(n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32)); // attention_norm
+            {
+                // Transformer layers
+                {
+                    // Layernorms
+                    ctx_size += mulf!(n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32)); // input_layernorm_weight
+                    ctx_size += mulf!(n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32)); // input_layernorm_bias
 
-            ctx_size += mulf!(n_layer, n_embd, n_embd, ggml::type_sizef(wtype)); // wq
-            ctx_size += mulf!(n_layer, n_embd, n_embd, ggml::type_sizef(wtype)); // wk
-            ctx_size += mulf!(n_layer, n_embd, n_embd, ggml::type_sizef(wtype)); // wv
-            ctx_size += mulf!(n_layer, n_embd, n_embd, ggml::type_sizef(wtype)); // wo
+                    ctx_size += mulf!(n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32)); // post_attention_layernorm_weight
+                    ctx_size += mulf!(n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32));
+                    // post_attention_layernorm_bias
+                }
 
-            ctx_size += mulf!(n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32)); // ffn_norm
+                {
+                    // Attention layer
+                    ctx_size += mulf!(n_layer, n_embd, n_embd, ggml::type_sizef(wtype)); // c_attn_q_proj_w
+                    ctx_size += mulf!(n_layer, n_embd, n_embd, ggml::type_sizef(wtype)); // c_attn_k_proj_w
+                    ctx_size += mulf!(n_layer, n_embd, n_embd, ggml::type_sizef(wtype)); // c_attn_v_proj_w
 
-            ctx_size += mulf!(n_layer, n_ff, n_embd, ggml::type_sizef(wtype)); // w1
-            ctx_size += mulf!(n_layer, n_ff, n_embd, ggml::type_sizef(wtype)); // w2
-            ctx_size += mulf!(n_layer, n_ff, n_embd, ggml::type_sizef(wtype)); // w3
+                    ctx_size += mulf!(n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32)); // c_attn_q_proj_bias
+                    ctx_size += mulf!(n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32)); // c_attn_k_proj_bias
+                    ctx_size += mulf!(n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32)); // c_attn_v_proj_bias
 
-            ctx_size += (5 + 10 * n_layer) * 256; // object overhead
+                    ctx_size += mulf!(n_layer, n_embd, n_embd, ggml::type_sizef(wtype)); // c_attn_proj_w
+                    ctx_size += mulf!(n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32));
+                    // c_attn_proj_bias
+                }
+
+                {
+                    // Feedforward layer
+                    ctx_size += mulf!(n_layer, 4, n_embd, n_embd, ggml::type_sizef(wtype)); // c_mlp_fc_w
+                    ctx_size += mulf!(n_layer, 4, n_embd, ggml::type_sizef(ggml::TYPE_F32)); // c_mlp_fc_b
+
+                    ctx_size += mulf!(n_layer, 4, n_embd, n_embd, ggml::type_sizef(wtype)); // c_mlp_proj_w_trans
+                    ctx_size += mulf!(n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32));
+                    // c_mlp_proj_b
+                }
+            }
+
+            ctx_size += mulf!(n_ctx, n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32)); // memory_k
+            ctx_size += mulf!(n_ctx, n_layer, n_embd, ggml::type_sizef(ggml::TYPE_F32)); // memory_v
+
+            ctx_size += (6 + 16 * n_layer) * 256; // object overhead
 
             load_progress_callback(LoadProgress::ContextSize {
                 bytes: ctx_size.try_into()?,
@@ -605,54 +650,125 @@ impl Model {
         let model = {
             let mut tensors = HashMap::new();
 
-            let tok_embeddings = context.new_tensor_2d(wtype, n_embd, n_vocab);
-            let norm = context.new_tensor_1d(ggml::TYPE_F32, n_embd);
-            let output = context.new_tensor_2d(wtype, n_embd, n_vocab);
+            let wte = context.new_tensor_2d(wtype, n_embd, n_vocab);
 
-            tensors.insert("tok_embeddings.weight".to_owned(), tok_embeddings.share());
-            tensors.insert("norm.weight".to_owned(), norm.share());
-            tensors.insert("output.weight".to_owned(), output.share());
+            let ln_f_g = context.new_tensor_1d(ggml::TYPE_F32, n_embd);
+            let ln_f_b = context.new_tensor_1d(ggml::TYPE_F32, n_embd);
+
+            let lmh_g = context.new_tensor_2d(wtype, n_embd, n_vocab);
+            // model.lmh_b  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_vocab);
+
+            // map by name
+            tensors.insert("gpt_neox.embed_in.weight".to_owned(), wte.share());
+
+            tensors.insert(
+                "gpt_neox.final_layer_norm.weight".to_owned(),
+                ln_f_g.share(),
+            );
+            tensors.insert("gpt_neox.final_layer_norm.bias".to_owned(), ln_f_b.share());
+
+            tensors.insert("embed_out.weight".to_owned(), lmh_g.share());
+            // model.tensors["lm_head.bias"]   = model.lmh_b;
 
             let mut layers = Vec::new();
             for i in 0..n_layer {
                 let layer = Layer {
-                    attention_norm: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
-                    wq: context.new_tensor_2d(wtype, n_embd, n_embd),
-                    wk: context.new_tensor_2d(wtype, n_embd, n_embd),
-                    wv: context.new_tensor_2d(wtype, n_embd, n_embd),
-                    wo: context.new_tensor_2d(wtype, n_embd, n_embd),
-                    ffn_norm: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
-                    w1: context.new_tensor_2d(wtype, n_embd, n_ff),
-                    w2: context.new_tensor_2d(wtype, n_ff, n_embd),
-                    w3: context.new_tensor_2d(wtype, n_embd, n_ff),
+                    //attention_norm: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
+                    input_layernorm_weight: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
+                    input_layernorm_bias: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
+                    post_attention_layernorm_weight: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
+                    post_attention_layernorm_bias: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
+
+                    // Attention
+                    c_attn_q_proj_w: context.new_tensor_2d(wtype, n_embd, n_embd),
+                    c_attn_k_proj_w: context.new_tensor_2d(wtype, n_embd, n_embd),
+                    c_attn_v_proj_w: context.new_tensor_2d(wtype, n_embd, n_embd),
+
+                    c_attn_q_proj_bias: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
+                    c_attn_k_proj_bias: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
+                    c_attn_v_proj_bias: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
+
+                    c_attn_proj_w: context.new_tensor_2d(wtype, n_embd, n_embd),
+                    c_attn_proj_bias: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
+
+                    // Feedforward
+                    c_mlp_fc_w: context.new_tensor_2d(wtype, n_embd, 4 * n_embd),
+                    c_mlp_fc_b: context.new_tensor_1d(ggml::TYPE_F32, 4 * n_embd),
+
+                    c_mlp_proj_w_trans: context.new_tensor_2d(wtype, 4 * n_embd, n_embd),
+                    c_mlp_proj_b: context.new_tensor_1d(ggml::TYPE_F32, n_embd),
                 };
 
+                // map by name
+                // Layernorms
                 tensors.insert(
-                    format!("layers.{i}.attention_norm.weight"),
-                    layer.attention_norm.share(),
+                    format!("gpt_neox.layers.{i}.input_layernorm.weight"),
+                    layer.input_layernorm_weight.share(),
+                );
+                tensors.insert(
+                    format!("gpt_neox.layers.{i}.input_layernorm.bias"),
+                    layer.input_layernorm_bias.share(),
+                );
+                tensors.insert(
+                    format!("gpt_neox.layers.{i}.post_attention_layernorm.weight"),
+                    layer.post_attention_layernorm_weight.share(),
+                );
+                tensors.insert(
+                    format!("gpt_neox.layers.{i}.post_attention_layernorm.bias"),
+                    layer.post_attention_layernorm_bias.share(),
                 );
 
-                tensors.insert(format!("layers.{i}.attention.wq.weight"), layer.wq.share());
-                tensors.insert(format!("layers.{i}.attention.wk.weight"), layer.wk.share());
-                tensors.insert(format!("layers.{i}.attention.wv.weight"), layer.wv.share());
-                tensors.insert(format!("layers.{i}.attention.wo.weight"), layer.wo.share());
-
+                // Attention
                 tensors.insert(
-                    format!("layers.{i}.ffn_norm.weight"),
-                    layer.ffn_norm.share(),
+                    format!("gpt_neox.layers.{i}.attention.query.weight"),
+                    layer.c_attn_q_proj_w.share(),
+                );
+                tensors.insert(
+                    format!("gpt_neox.layers.{i}.attention.query.bias"),
+                    layer.c_attn_q_proj_bias.share(),
+                );
+                tensors.insert(
+                    format!("gpt_neox.layers.{i}.attention.key.weight"),
+                    layer.c_attn_k_proj_w.share(),
+                );
+                tensors.insert(
+                    format!("gpt_neox.layers.{i}.attention.key.bias"),
+                    layer.c_attn_k_proj_bias.share(),
+                );
+                tensors.insert(
+                    format!("gpt_neox.layers.{i}.attention.value.weight"),
+                    layer.c_attn_v_proj_w.share(),
+                );
+                tensors.insert(
+                    format!("gpt_neox.layers.{i}.attention.value.bias"),
+                    layer.c_attn_v_proj_bias.share(),
+                );
+                tensors.insert(
+                    format!("gpt_neox.layers.{i}.attention.dense.weight"),
+                    layer.c_attn_proj_w.share(),
+                );
+                tensors.insert(
+                    format!("gpt_neox.layers.{i}.attention.dense.bias"),
+                    layer.c_attn_proj_bias.share(),
                 );
 
+                // Feedforward
                 tensors.insert(
-                    format!("layers.{i}.feed_forward.w1.weight"),
-                    layer.w1.share(),
+                    format!("gpt_neox.layers.{i}.mlp.dense_h_to_4h.weight"),
+                    layer.c_mlp_fc_w.share(),
                 );
                 tensors.insert(
-                    format!("layers.{i}.feed_forward.w2.weight"),
-                    layer.w2.share(),
+                    format!("gpt_neox.layers.{i}.mlp.dense_h_to_4h.bias"),
+                    layer.c_mlp_fc_b.share(),
+                );
+
+                tensors.insert(
+                    format!("gpt_neox.layers.{i}.mlp.dense_4h_to_h.weight"),
+                    layer.c_mlp_proj_w_trans.share(),
                 );
                 tensors.insert(
-                    format!("layers.{i}.feed_forward.w3.weight"),
-                    layer.w3.share(),
+                    format!("gpt_neox.layers.{i}.mlp.dense_4h_to_h.bias"),
+                    layer.c_mlp_proj_b.share(),
                 );
 
                 layers.push(layer);
@@ -660,9 +776,10 @@ impl Model {
 
             Model {
                 hparams,
-                tok_embeddings,
-                norm,
-                output,
+                lmh_g,
+                ln_f_b,
+                ln_f_g,
+                wte,
                 layers,
                 tensors,
                 _context: context,
@@ -1078,11 +1195,11 @@ impl Model {
             n_vocab,
             n_ctx,
             n_embd,
-            n_mult: _,
             n_head,
             n_layer,
             n_rot,
             f16_: _,
+            use_parallel_residual: _,
         } = self.hparams;
 
         // For the first run, we need to guess a maximum buffer size so we can measure
@@ -1099,28 +1216,45 @@ impl Model {
         let embd = ctx0.new_tensor_1d(ggml::TYPE_I32, n as i32);
         unsafe { embd.write_data(bytemuck::cast_slice(input_tokens)) };
 
-        let mut input_layer = ctx0.op_get_rows(&self.tok_embeddings, &embd);
+        let mut input_layer = ctx0.op_get_rows(&self.wte, &embd);
 
         for il in 0..n_layer as usize {
-            let input_self_attention = input_layer.share();
             let mut current: ggml::Tensor;
 
-            // norm
+            // input norm
             {
                 current = ctx0.op_norm(&input_layer);
 
                 // cur = attention_norm * cur
-                current = ctx0.op_mul(
-                    &ctx0.op_repeat(&self.layers[il].attention_norm, &current),
-                    &current,
-                );
+                current = ctx0.op_add(
+                    &ctx0.op_mul(
+                        &ctx0.op_repeat(&self.layers[il].input_layernorm_weight, &current),
+                        &current,
+                    ),
+                    &ctx0.op_repeat(&self.layers[il].input_layernorm_bias, &current),
+                )
             }
 
             // self-attention
             {
-                let q_current = ctx0.op_mul_mat(&self.layers[il].wq, &current);
-                let k_current = ctx0.op_mul_mat(&self.layers[il].wk, &current);
-                let v_current = ctx0.op_mul_mat(&self.layers[il].wv, &current);
+                // weight
+                let mut q_current = ctx0.op_mul_mat(&self.layers[il].c_attn_q_proj_w, &current);
+                let mut k_current = ctx0.op_mul_mat(&self.layers[il].c_attn_k_proj_w, &current);
+                let mut v_current = ctx0.op_mul_mat(&self.layers[il].c_attn_v_proj_w, &current);
+
+                // Add bias
+                q_current = ctx0.op_add(
+                    &q_current,
+                    &ctx0.op_repeat(&self.layers[il].c_attn_q_proj_bias, &q_current),
+                );
+                k_current = ctx0.op_add(
+                    &k_current,
+                    &ctx0.op_repeat(&self.layers[il].c_attn_k_proj_bias, &k_current),
+                );
+                v_current = ctx0.op_add(
+                    &v_current,
+                    &ctx0.op_repeat(&self.layers[il].c_attn_v_proj_bias, &v_current),
+                );
 
                 // store key and value to memory
                 if n >= 1 {
@@ -1144,7 +1278,7 @@ impl Model {
 
                 // Q = Qcur.contiguous().view(n_embd/n_head, n_head, N).permute(0, 2, 1, 3)
                 let q = ctx0.op_permute(
-                    &ctx0.op_rope(
+                    &ctx0.op_gtpneox_rope(
                         &ctx0.op_cpy(
                             &q_current,
                             &ctx0.new_tensor_3d(ggml::TYPE_F32, n_embd / n_head, n_head, n as i32),
@@ -1161,7 +1295,7 @@ impl Model {
 
                 // K = Kmem.view(n_embd/n_head, n_head, n_past + N).permute(0, 2, 1, 3)
                 let k = ctx0.op_permute(
-                    &ctx0.op_rope(
+                    &ctx0.op_gtpneox_rope(
                         &ctx0.op_reshape_3d(
                             &ctx0.op_view_1d(
                                 &session.memory_k,
@@ -1229,54 +1363,137 @@ impl Model {
                     &ctx0.new_tensor_2d(ggml::TYPE_F32, n_embd, n as i32),
                 );
 
-                // projection (no bias)
-                current = ctx0.op_mul_mat(&self.layers[il].wo, &current);
+                // projection (first weight)
+                current = ctx0.op_mul_mat(&self.layers[il].c_attn_proj_w, &current);
+
+                // projection (then weight)
+                current = ctx0.op_add(
+                    &current,
+                    &ctx0.op_repeat(&self.layers[il].c_attn_proj_bias, &current),
+                );
             }
 
-            let input_feed_forward = ctx0.op_add(&current, &input_self_attention);
+            let mut input_feed_forward: ggml::Tensor;
 
-            // feed-forward network
-            {
-                // norm
+            if self.hparams.use_parallel_residual == 0 {
+                input_feed_forward = ctx0.op_add(&current, &input_layer);
+
+                // post attention layer norm
                 {
-                    current = ctx0.op_norm(&input_feed_forward);
+                    input_feed_forward = ctx0.op_norm(&input_feed_forward);
 
-                    // cur = ffn_norm*cur
-                    current = ctx0.op_mul(
-                        &ctx0.op_repeat(&self.layers[il].ffn_norm, &current),
-                        &current,
+                    // inpFF = input_layernorm_weight*inpFF + input_layernorm_bias
+                    input_feed_forward = ctx0.op_add(
+                        &ctx0.op_mul(
+                            &ctx0.op_repeat(
+                                &self.layers[il].post_attention_layernorm_weight,
+                                &input_feed_forward,
+                            ),
+                            &input_feed_forward,
+                        ),
+                        &ctx0.op_repeat(
+                            &self.layers[il].post_attention_layernorm_bias,
+                            &input_feed_forward,
+                        ),
                     );
                 }
 
-                let tmp = ctx0.op_mul_mat(&self.layers[il].w3, &current);
+                // feed-forward network
 
-                current = ctx0.op_mul_mat(&self.layers[il].w1, &current);
+                {
+                    // note here we pass inpFF instead of cur
+                    input_feed_forward =
+                        ctx0.op_mul_mat(&self.layers[il].c_mlp_fc_w, &input_feed_forward);
 
-                // SILU activation
-                current = ctx0.op_silu(&current);
+                    //inpFF = ggml_add(ctx0, ggml_repeat(ctx0, model.layers[il].c_mlp_fc_b, inpFF), inpFF);
+                    input_feed_forward = ctx0.op_add(
+                        &ctx0.op_repeat(&self.layers[il].c_mlp_fc_b, &input_feed_forward),
+                        &input_feed_forward,
+                    );
 
-                current = ctx0.op_mul(&current, &tmp);
+                    // inpFF = ggml_gelu(ctx0, inpFF);
+                    input_feed_forward = ctx0.op_gelu(&input_feed_forward);
 
-                current = ctx0.op_mul_mat(&self.layers[il].w2, &current);
+                    // inpFF = ggml_mul_mat(ctx0, model.layers[il].c_mlp_proj_w_trans, inpFF);
+                    input_feed_forward =
+                        ctx0.op_mul_mat(&self.layers[il].c_mlp_proj_w_trans, &input_feed_forward);
+
+                    // inpFF = ggml_add(ctx0, ggml_repeat(ctx0, model.layers[il].c_mlp_proj_b, inpFF), inpFF);
+                    input_feed_forward = ctx0.op_add(
+                        &ctx0.op_repeat(&self.layers[il].c_mlp_proj_b, &input_feed_forward),
+                        &input_feed_forward,
+                    );
+                }
+
+                input_layer = ctx0.op_add(&input_feed_forward, &input_layer);
+            } else if self.hparams.use_parallel_residual == 1 {
+                // post attention layer norm
+                {
+                    input_feed_forward = ctx0.op_norm(&input_layer);
+
+                    // inpFF = input_layernorm_weight*inpFF + input_layernorm_bias
+                    input_feed_forward = ctx0.op_add(
+                        &ctx0.op_mul(
+                            &ctx0.op_repeat(
+                                &self.layers[il].post_attention_layernorm_weight,
+                                &input_feed_forward,
+                            ),
+                            &input_feed_forward,
+                        ),
+                        &ctx0.op_repeat(
+                            &self.layers[il].post_attention_layernorm_bias,
+                            &input_feed_forward,
+                        ),
+                    );
+                }
+
+                // feed-forward network
+                {
+                    // note here we pass inpFF instead of cur
+                    input_feed_forward =
+                        ctx0.op_mul_mat(&self.layers[il].c_mlp_fc_w, &input_feed_forward);
+
+                    input_feed_forward = ctx0.op_add(
+                        &ctx0.op_repeat(&self.layers[il].c_mlp_fc_b, &input_feed_forward),
+                        &input_feed_forward,
+                    );
+
+                    // GELU activiation
+                    input_feed_forward = ctx0.op_gelu(&input_feed_forward);
+
+                    // projection
+                    // inpFF = proj_w*inpFF + proj_b
+                    input_feed_forward =
+                        ctx0.op_mul_mat(&self.layers[il].c_mlp_proj_w_trans, &input_feed_forward);
+
+                    input_feed_forward = ctx0.op_add(
+                        &ctx0.op_repeat(&self.layers[il].c_mlp_proj_b, &input_feed_forward),
+                        &input_feed_forward,
+                    );
+                }
+
+                // inpL = inpL + inpFF + cur
+                input_feed_forward = ctx0.op_add(&current, &input_feed_forward);
+                input_layer = ctx0.op_add(&input_feed_forward, &input_layer);
+            } else {
+                panic!("unknown use_parallel_residual");
             }
-
-            current = ctx0.op_add(&current, &input_feed_forward);
-
-            // input for next layer
-            input_layer = current;
         }
 
         // norm
         {
             input_layer = ctx0.op_norm(&input_layer);
 
-            // inpL = norm*inpL
-            input_layer = ctx0.op_mul(&ctx0.op_repeat(&self.norm, &input_layer), &input_layer);
+            // inpL = ln_f_g*inpL + ln_f_b
+            input_layer = ctx0.op_add(
+                &ctx0.op_mul(&ctx0.op_repeat(&self.ln_f_g, &input_layer), &input_layer),
+                &ctx0.op_repeat(&self.ln_f_b, &input_layer),
+            );
         }
 
         // lm_head
         {
-            input_layer = ctx0.op_mul_mat(&self.output, &input_layer);
+            input_layer = ctx0.op_mul_mat(&self.lmh_g, &input_layer);
         }
 
         // logits -> probs
@@ -1559,17 +1776,9 @@ impl Vocabulary {
         let mut i = len;
         while i > 0 {
             let token_id = prev[i];
-            if token_id == 0 {
-                return Err(InferenceError::TokenizationFailed);
-            }
             let token = self.id_to_token[token_id as usize].as_str();
             res.push((token, token_id));
             i -= token.len();
-        }
-
-        if bos {
-            // TODO: replace with vocab.bos
-            res.push(("", 1));
         }
 
         // Pieces are in reverse order so correct that
